@@ -12,7 +12,7 @@ import math
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from finance_engine import analizar_cartera
+from finance_engine import analizar_cartera, test_estres
 
 app = Flask(__name__)
 
@@ -68,6 +68,33 @@ def dashboard():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:  # noqa: BLE001 — devolvemos el error tal cual para debug
+        return jsonify({"error": f"Error interno: {e}"}), 500
+
+
+@app.post("/api/stress-test")
+def stress_test():
+    """
+    Body JSON esperado:
+    {
+      "tickers": [...],
+      "pesos": {...},
+      "beta": 1.15   // la beta de la cartera, calculada por /api/dashboard
+    }
+    Tarda más que /api/dashboard porque descarga historial de hasta 35+ años.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        resultado = test_estres(
+            tickers=data.get("tickers", []),
+            pesos_raw=data.get("pesos", {}),
+            beta_cartera=float(data.get("beta", 1.0)),
+        )
+        return jsonify(_limpiar_nan({"eventos": resultado}))
+    except KeyError as e:
+        return jsonify({"error": f"Falta el campo {e}"}), 400
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:  # noqa: BLE001
         return jsonify({"error": f"Error interno: {e}"}), 500
 
 

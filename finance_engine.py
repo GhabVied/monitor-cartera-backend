@@ -53,6 +53,91 @@ def calcular_retornos(precios: pd.DataFrame) -> pd.DataFrame:
     return precios.pct_change().dropna(how="all")
 
 
+def descargar_historial_extendido(tickers: list[str], desde: str = "1989-01-01") -> pd.DataFrame:
+    """Descarga el historial más largo posible de precios (para el test de estrés)."""
+    raw = yf.download(tickers, start=desde, auto_adjust=True, progress=False)
+    if raw.empty:
+        return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        precios = raw["Close"]
+    else:
+        precios = raw[["Close"]]
+        precios.columns = tickers
+    return precios.dropna(axis=1, how="all")
+
+
+# ------------------------------------------------------------------
+# BASE DE DATOS DE CRISIS HISTÓRICAS (para el test de estrés)
+# ------------------------------------------------------------------
+
+CRISIS_HISTORICAS = [
+    {"evento": "Guerra del Golfo / Shock del petróleo", "categoria": "Geopolítica / energía",
+     "peak": "1990-07-16", "trough": "1990-10-11", "recovery": "1991-02-13"},
+    {"evento": "Crisis Financiera Global (2008)", "categoria": "Crisis financiera / crediticia",
+     "peak": "2007-10-09", "trough": "2009-03-09", "recovery": "2013-03-28"},
+    {"evento": "Crisis de Deuda EE.UU. / Europa", "categoria": "Crisis soberana / macro",
+     "peak": "2011-04-29", "trough": "2011-10-03", "recovery": "2012-02-28"},
+    {"evento": "Selloff Q4 2018", "categoria": "Suba de tasas / guerra comercial",
+     "peak": "2018-09-20", "trough": "2018-12-24", "recovery": "2019-04-23"},
+    {"evento": "Crash COVID-19", "categoria": "Pandemia / shock exógeno",
+     "peak": "2020-02-19", "trough": "2020-03-23", "recovery": "2020-08-18"},
+    {"evento": "Bear Market 2022", "categoria": "Inflación / suba de tasas",
+     "peak": "2022-01-03", "trough": "2022-10-12", "recovery": "2024-01-19"},
+]
+
+
+def analizar_estres_historico(
+    precios_extendidos: pd.DataFrame,
+    precio_indice: pd.Series,
+    pesos: pd.Series,
+    beta_cartera: float,
+) -> list[dict]:
+    """Para cada crisis histórica, calcula la caída real del índice y estima/calcula
+    la caída de la cartera actual. Devuelve una lista de dicts lista para JSON."""
+    primeras_fechas = precios_extendidos.apply(lambda s: s.first_valid_index())
+    filas = []
+
+    for crisis in CRISIS_HISTORICAS:
+        peak = pd.Timestamp(crisis["peak"])
+        trough = pd.Timestamp(crisis["trough"])
+        recovery = pd.Timestamp(crisis["recovery"])
+
+        indice_hasta_peak = precio_indice.loc[:peak].dropna()
+        ventana_indice = precio_indice.loc[peak:trough].dropna()
+        dd_indice = None
+        if len(indice_hasta_peak) and len(ventana_indice):
+            valor_pico = indice_hasta_peak.iloc[-1]
+            dd_indice = float(ventana_indice.min() / valor_pico - 1)
+
+        cobertura_completa = all(
+            (primeras_fechas.get(t) is not None) and (primeras_fechas[t] <= peak)
+            for t in pesos.index
+        )
+
+        dd_cartera_real = None
+        if cobertura_completa:
+            sub_precios = precios_extendidos[pesos.index].loc[peak:trough].dropna()
+            if len(sub_precios) > 1:
+                sub_retornos = sub_precios.pct_change().dropna()
+                ret_cartera = (sub_retornos * pesos).sum(axis=1)
+                dd_cartera_real = float((1 + ret_cartera).cumprod().min() - 1)
+
+        dd_cartera_estimada = beta_cartera * dd_indice if dd_indice is not None else None
+
+        filas.append({
+            "evento": crisis["evento"],
+            "categoria": crisis["categoria"],
+            "periodo": f"{peak.date()} → {trough.date()}",
+            "caida_indice_pct": round(dd_indice * 100, 2) if dd_indice is not None else None,
+            "caida_cartera_estimada_pct": round(dd_cartera_estimada * 100, 2) if dd_cartera_estimada is not None else None,
+            "caida_cartera_real_pct": round(dd_cartera_real * 100, 2) if dd_cartera_real is not None else None,
+            "cobertura_completa": cobertura_completa,
+            "dias_recuperacion": (recovery - peak).days,
+        })
+
+    return filas
+
+
 # ------------------------------------------------------------------
 # MÉTRICAS DE RIESGO Y RETORNO
 # ------------------------------------------------------------------
@@ -138,6 +223,173 @@ def metricas_cartera(retornos: pd.Series, retornos_bm: pd.Series, rf: float) -> 
         "var_95": var_historico(retornos),
         "cvar_95": cvar_historico(retornos),
         "beta": beta_vs_benchmark(retornos, retornos_bm),
+    }
+
+
+def descomponer_riesgo(pesos: pd.Series, retornos: pd.DataFrame, retornos_cartera: pd.Series) -> tuple[list[dict], float]:
+    """Descompone la volatilidad total de la cartera en el aporte de cada activo."""
+    activos = list(pesos.index)
+    cov = retornos[activos].cov().values * DIAS_BURSATILES
+    w = pesos.reindex(activos).values
+    vol_cartera = float(np.sqrt(w @ cov @ w))
+
+    mcr = np.zeros_like(w) if vol_cartera == 0 else (cov @ w) / vol_cartera
+    ccr = w * mcr
+    pct_riesgo = ccr / vol_cartera if vol_cartera != 0 else np.zeros_like(w)
+    vol_individual = np.sqrt(np.diag(cov))
+    correlaciones = [retornos[t].corr(retornos_cartera) for t in activos]
+
+    filas = []
+    for i, t in enumerate(activos):
+        filas.append({
+            "activo": t,
+            "peso_pct": w[i] * 100,
+            "vol_anual_pct": vol_individual[i] * 100,
+            "correlacion": correlaciones[i],
+            "riesgo_pct": pct_riesgo[i] * 100,
+            "delta_vs_peso": pct_riesgo[i] * 100 - w[i] * 100,
+        })
+    filas.sort(key=lambda f: f["riesgo_pct"], reverse=True)
+    return filas, vol_cartera
+
+
+def matriz_correlacion(retornos: pd.DataFrame) -> dict:
+    if retornos.shape[1] < 2:
+        return {"tickers": list(retornos.columns), "matriz": []}
+    corr = retornos.corr().round(4)
+    return {"tickers": list(corr.columns), "matriz": corr.values.tolist()}
+
+
+# ------------------------------------------------------------------
+# OPTIMIZACIÓN DE CARTERA (TEORÍA MODERNA DE PORTAFOLIO — MARKOWITZ)
+# ------------------------------------------------------------------
+
+def _retorno_cartera_w(w: np.ndarray, mu: np.ndarray) -> float:
+    return float(np.dot(w, mu))
+
+
+def _volatilidad_cartera_w(w: np.ndarray, cov: np.ndarray) -> float:
+    return float(np.sqrt(np.dot(w.T, np.dot(cov, w))))
+
+
+def preparar_inputs_optimizacion(retornos: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    activos = list(retornos.columns)
+    mu = retornos.mean().values * DIAS_BURSATILES
+    cov = retornos.cov().values * DIAS_BURSATILES
+    return mu, cov, activos
+
+
+def optimizar_cartera(
+    mu: np.ndarray,
+    cov: np.ndarray,
+    objetivo: str,
+    rf: float = 0.0,
+    retorno_objetivo: float | None = None,
+    permitir_corto: bool = False,
+    pesos_minimos: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """objetivo: 'min_vol' | 'max_sharpe' | 'retorno_objetivo'."""
+    import scipy.optimize as sco
+
+    n = len(mu)
+    piso_default = -1.0 if permitir_corto else 0.0
+    if pesos_minimos is None:
+        pesos_minimos = np.zeros(n)
+
+    pisos = np.maximum(piso_default, pesos_minimos)
+    if pisos.sum() > 1.0 + 1e-9:
+        return None
+
+    bounds = tuple((float(pisos[i]), 1.0) for i in range(n))
+    remanente = max(0.0, 1.0 - pisos.sum())
+    w0 = pisos + remanente / n
+
+    restricciones = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+
+    if objetivo == "min_vol":
+        fun = lambda w: _volatilidad_cartera_w(w, cov)
+    elif objetivo == "max_sharpe":
+        fun = lambda w: -(_retorno_cartera_w(w, mu) - rf) / _volatilidad_cartera_w(w, cov)
+    elif objetivo == "retorno_objetivo":
+        fun = lambda w: _volatilidad_cartera_w(w, cov)
+        restricciones.append({"type": "eq", "fun": lambda w: _retorno_cartera_w(w, mu) - retorno_objetivo})
+    else:
+        raise ValueError(f"Objetivo desconocido: {objetivo}")
+
+    resultado = sco.minimize(
+        fun, w0, method="SLSQP", bounds=bounds, constraints=restricciones,
+        options={"maxiter": 500, "ftol": 1e-10},
+    )
+    return resultado.x if resultado.success else None
+
+
+def calcular_frontera_eficiente(
+    mu: np.ndarray, cov: np.ndarray, n_puntos: int = 30,
+    permitir_corto: bool = False, pesos_minimos: np.ndarray | None = None,
+) -> list[dict]:
+    ret_min, ret_max = mu.min(), mu.max()
+    objetivos = np.linspace(ret_min, ret_max, n_puntos)
+    puntos = []
+    for r_obj in objetivos:
+        w = optimizar_cartera(
+            mu, cov, "retorno_objetivo", retorno_objetivo=r_obj,
+            permitir_corto=permitir_corto, pesos_minimos=pesos_minimos,
+        )
+        if w is not None:
+            puntos.append({"retorno": r_obj, "volatilidad": _volatilidad_cartera_w(w, cov)})
+    return puntos
+
+
+def optimizacion_completa(
+    retornos: pd.DataFrame, pesos_usuario: pd.Series, rf: float,
+    permitir_corto: bool = False, pesos_minimos_dict: dict | None = None,
+) -> dict | None:
+    """Arma toda la sección de optimización: cartera min-vol, max-sharpe, frontera
+    y la comparación con la cartera del usuario. None si no se pudo resolver."""
+    if retornos.shape[1] < 2:
+        return None
+
+    mu, cov, activos_opt = preparar_inputs_optimizacion(retornos)
+    pesos_minimos_dict = pesos_minimos_dict or {}
+    vector_minimos = np.array([pesos_minimos_dict.get(t, 0.0) / 100 for t in activos_opt])
+
+    if vector_minimos.sum() > 1.0 + 1e-9:
+        return {"error": "La suma de los pesos mínimos supera el 100%."}
+
+    w_min_vol = optimizar_cartera(mu, cov, "min_vol", permitir_corto=permitir_corto, pesos_minimos=vector_minimos)
+    w_max_sharpe = optimizar_cartera(mu, cov, "max_sharpe", rf=rf, permitir_corto=permitir_corto, pesos_minimos=vector_minimos)
+    frontera = calcular_frontera_eficiente(mu, cov, permitir_corto=permitir_corto, pesos_minimos=vector_minimos)
+
+    if w_min_vol is None or w_max_sharpe is None:
+        return {"error": "No se pudo resolver la optimización con los datos y restricciones actuales."}
+
+    pesos_u = np.array([pesos_usuario.get(t, 0.0) for t in activos_opt])
+
+    def resumen(w):
+        ret = _retorno_cartera_w(w, mu)
+        vol = _volatilidad_cartera_w(w, cov)
+        sharpe = (ret - rf) / vol if vol > 0 else float("nan")
+        return {"retorno_pct": ret * 100, "vol_pct": vol * 100, "sharpe": sharpe}
+
+    return {
+        "activos": activos_opt,
+        "individuales": [
+            {"activo": t, "vol_pct": float(np.sqrt(cov[i, i])) * 100, "retorno_pct": float(mu[i]) * 100}
+            for i, t in enumerate(activos_opt)
+        ],
+        "frontera": [{"retorno_pct": p["retorno"] * 100, "vol_pct": p["volatilidad"] * 100} for p in frontera],
+        "tu_cartera": resumen(pesos_u),
+        "min_volatilidad": resumen(w_min_vol),
+        "max_sharpe": resumen(w_max_sharpe),
+        "pesos_comparados": [
+            {
+                "activo": t,
+                "tu_cartera_pct": pesos_u[i] * 100,
+                "min_vol_pct": w_min_vol[i] * 100,
+                "max_sharpe_pct": w_max_sharpe[i] * 100,
+            }
+            for i, t in enumerate(activos_opt)
+        ],
     }
 
 
@@ -228,13 +480,59 @@ def analizar_cartera(
     equity_bm = (1 + retornos_bm).cumprod() * 100
     fechas = [d.strftime("%Y-%m-%d") for d in equity_cartera.index]
 
+    # Drawdown de la cartera
+    dd_cartera = serie_drawdown(retornos_cartera) * 100
+
+    # Matriz de correlación entre activos
+    correlacion = matriz_correlacion(retornos)
+
+    # Descomposición de riesgo por activo
+    riesgo_por_activo, vol_cartera_desc = descomponer_riesgo(pesos_validos, retornos, retornos_cartera)
+
+    # Optimización de cartera (frontera eficiente, min-vol, max-sharpe)
+    optimizacion = optimizacion_completa(
+        retornos, pesos_validos, rf,
+        permitir_corto=False, pesos_minimos_dict=None,
+    )
+
     return {
         "fechas": fechas,
         "equity_cartera": [round(v, 4) for v in equity_cartera.tolist()],
         "equity_benchmark": [round(v, 4) for v in equity_bm.tolist()],
+        "drawdown_cartera": [round(v, 4) for v in dd_cartera.tolist()],
         "metricas_cartera": met,
         "metricas_benchmark": met_bm,
         "activos": activos,
+        "correlacion": correlacion,
+        "riesgo_por_activo": riesgo_por_activo,
+        "vol_cartera_descomp_pct": vol_cartera_desc * 100,
+        "optimizacion": optimizacion,
         "faltantes": faltantes,
         "benchmark": benchmark_ticker,
     }
+
+
+def test_estres(
+    tickers: list[str],
+    pesos_raw: dict[str, float],
+    beta_cartera: float,
+) -> list[dict]:
+    """Descarga el historial más largo posible y calcula las caídas de la cartera
+    actual durante las crisis históricas más relevantes. Es una llamada aparte
+    (más lenta) porque descarga hasta 35+ años de historial."""
+    tickers = [t.strip().upper() for t in tickers if t.strip()]
+    suma = sum(pesos_raw.values())
+    if suma <= 0:
+        raise ValueError("La suma de los pesos debe ser mayor a 0.")
+    pesos = pd.Series({t: pesos_raw[t] / suma for t in tickers if t in pesos_raw})
+
+    precios_ext = descargar_historial_extendido(tickers + ["^GSPC"])
+    if precios_ext.empty or "^GSPC" not in precios_ext.columns:
+        raise ValueError("No se pudo descargar el historial extendido del S&P 500 (^GSPC).")
+
+    indice = precios_ext["^GSPC"]
+    tickers_disponibles = [t for t in pesos.index if t in precios_ext.columns]
+    pesos = pesos.reindex(tickers_disponibles)
+    pesos = pesos / pesos.sum()
+
+    return analizar_estres_historico(precios_ext.drop(columns=["^GSPC"]), indice, pesos, beta_cartera)
