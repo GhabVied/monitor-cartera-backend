@@ -13,6 +13,14 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+# En servidores como Render, la carpeta donde yfinance guarda su caché
+# interno (zonas horarias, etc.) puede no tener permiso de escritura,
+# lo que produce el error "database is locked". /tmp sí es escribible.
+try:
+    yf.set_tz_cache_location("/tmp/yfinance_cache")
+except Exception:
+    pass
+
 DIAS_BURSATILES = 252
 
 
