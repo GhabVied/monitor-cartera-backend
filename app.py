@@ -12,7 +12,7 @@ import math
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from finance_engine import analizar_cartera, test_estres
+from finance_engine import analizar_cartera, evaluar_screener, test_estres
 
 app = Flask(__name__)
 
@@ -93,6 +93,34 @@ def stress_test():
             beta_cartera=float(data.get("beta", 1.0)),
         )
         return jsonify(_limpiar_nan({"eventos": resultado}))
+    except KeyError as e:
+        return jsonify({"error": f"Falta el campo {e}"}), 400
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"Error interno: {e}"}), 500
+
+
+@app.post("/api/screener")
+def screener():
+    """
+    Body JSON esperado:
+    {
+      "tickers": [...],
+      "pesos": {...},
+      "estrategia": "lynch"   // o "buffett"
+    }
+    Consulta datos fundamentales de Yahoo Finance para cada ticker (en paralelo,
+    con caché de 24hs), así que la primera vez puede tardar 10-30 segundos.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        resultado = evaluar_screener(
+            tickers=data.get("tickers", []),
+            pesos_raw=data.get("pesos", {}),
+            estrategia=data.get("estrategia", "lynch"),
+        )
+        return jsonify(_limpiar_nan(resultado))
     except KeyError as e:
         return jsonify({"error": f"Falta el campo {e}"}), 400
     except ValueError as e:

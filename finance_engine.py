@@ -8,6 +8,7 @@
 # ============================================================
 
 import datetime as dt
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -559,3 +560,154 @@ def test_estres(
     pesos = pesos / pesos.sum()
 
     return analizar_estres_historico(precios_ext.drop(columns=["^GSPC"]), indice, pesos, beta_cartera)
+
+
+# ============================================================
+# SCREENING FUNDAMENTAL — Peter Lynch (GARP) y Buffett/Munger
+# (Pestaña 2 y 3 de la app original)
+# ============================================================
+
+UMBRAL_MID_CAP = 2_000_000_000  # USD. Por debajo de esto se considera small cap.
+
+# Cada criterio: (nombre, clave_en_fundamentales, texto_umbral, condicion, formateador)
+CRITERIOS_LYNCH = [
+    ("P/E", "pe", "< 25", lambda v: v < 25, lambda v: f"{v:.1f}"),
+    ("Fwd P/E", "fwd_pe", "< 15", lambda v: v < 15, lambda v: f"{v:.1f}"),
+    ("D/E", "de", "< 0.4", lambda v: v < 0.4, lambda v: f"{v:.2f}"),
+    ("EPS YoY", "eps_yoy", "> 15%", lambda v: v > 0.15, lambda v: f"{v*100:.1f}%"),
+    ("PEG", "peg", "< 2", lambda v: v < 2, lambda v: f"{v:.2f}"),
+    ("Mid+", "market_cap", "≥ Mid Cap", lambda v: v >= UMBRAL_MID_CAP, lambda v: f"${v/1e9:.1f}B"),
+]
+
+CRITERIOS_BUFFETT = [
+    ("ROE", "roe", "> 15%", lambda v: v > 0.15, lambda v: f"{v*100:.1f}%"),
+    ("D/E", "de", "< 0.5", lambda v: v < 0.5, lambda v: f"{v:.2f}"),
+    ("Gross Margin", "gross_margin", "> 30%", lambda v: v > 0.30, lambda v: f"{v*100:.1f}%"),
+    ("P/E", "pe", "< 25", lambda v: v < 25, lambda v: f"{v:.1f}"),
+    ("Profitable", "profit_margin", "> 0%", lambda v: v > 0, lambda v: f"{v*100:.1f}%"),
+    ("Mid+", "market_cap", "≥ Mid Cap", lambda v: v >= UMBRAL_MID_CAP, lambda v: f"${v/1e9:.1f}B"),
+]
+
+ESTRATEGIAS_SCREENER = {"lynch": CRITERIOS_LYNCH, "buffett": CRITERIOS_BUFFETT}
+
+# Caché simple en memoria (24hs), igual que el st.cache_data del original.
+# Como Render free es un solo proceso, un dict alcanza; se pierde al reiniciar.
+_CACHE_FUNDAMENTALES: dict[tuple, tuple] = {}
+_CACHE_TTL_SEGUNDOS = 60 * 60 * 24
+
+
+def _fundamentales_de_un_ticker(t: str) -> dict:
+    try:
+        info = yf.Ticker(t).info
+        de = info.get("debtToEquity")
+        de = de / 100 if de is not None else None
+        eps_yoy = info.get("earningsGrowth")
+        if eps_yoy is None:
+            eps_yoy = info.get("earningsQuarterlyGrowth")
+        peg = info.get("pegRatio") or info.get("trailingPegRatio")
+        return {
+            "pe": info.get("trailingPE"),
+            "fwd_pe": info.get("forwardPE"),
+            "de": de,
+            "eps_yoy": eps_yoy,
+            "peg": peg,
+            "market_cap": info.get("marketCap"),
+            "roe": info.get("returnOnEquity"),
+            "gross_margin": info.get("grossMargins"),
+            "profit_margin": info.get("profitMargins"),
+            "nombre": info.get("shortName") or t,
+        }
+    except Exception:
+        return {
+            "pe": None, "fwd_pe": None, "de": None, "eps_yoy": None, "peg": None,
+            "market_cap": None, "roe": None, "gross_margin": None, "profit_margin": None,
+            "nombre": t,
+        }
+
+
+def obtener_fundamentales_screener(tickers: list[str]) -> dict:
+    """Trae de Yahoo Finance los datos fundamentales usados por cualquiera de
+    las estrategias de screening. Consulta cada ticker en paralelo (son
+    llamadas independientes) y cachea el resultado combinado 24hs."""
+    clave_cache = tuple(sorted(tickers))
+    ahora = dt.datetime.utcnow().timestamp()
+    if clave_cache in _CACHE_FUNDAMENTALES:
+        guardado_en, datos_cacheados = _CACHE_FUNDAMENTALES[clave_cache]
+        if ahora - guardado_en < _CACHE_TTL_SEGUNDOS:
+            return datos_cacheados
+
+    datos = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(tickers) or 1)) as ex:
+        futuros = {ex.submit(_fundamentales_de_un_ticker, t): t for t in tickers}
+        for fut in as_completed(futuros):
+            t = futuros[fut]
+            datos[t] = fut.result()
+
+    _CACHE_FUNDAMENTALES[clave_cache] = (ahora, datos)
+    return datos
+
+
+def evaluar_screener(tickers: list[str], pesos_raw: dict[str, float], estrategia: str) -> dict:
+    """Punto de entrada único para /api/screener. estrategia: 'lynch' | 'buffett'."""
+    if estrategia not in ESTRATEGIAS_SCREENER:
+        raise ValueError(f"Estrategia desconocida: {estrategia}")
+    criterios = ESTRATEGIAS_SCREENER[estrategia]
+
+    tickers = [t.strip().upper() for t in tickers if t.strip()]
+    tickers = list(dict.fromkeys(tickers))
+    if not tickers:
+        raise ValueError("Ingresá al menos un ticker.")
+
+    suma = sum(pesos_raw.values()) or 1
+    pesos_pct = {t: (pesos_raw.get(t, 0) / suma) * 100 for t in tickers}
+
+    fundamentales = obtener_fundamentales_screener(tickers)
+
+    filas = []
+    for t in tickers:
+        d = fundamentales.get(t, {})
+        cumplidos, evaluables = 0, 0
+        criterios_fila = []
+        for nombre_col, clave, umbral_txt, condicion, formateador in criterios:
+            valor = d.get(clave)
+            if valor is None:
+                ok = None
+                valor_fmt = "N/D"
+            else:
+                try:
+                    ok = bool(condicion(valor))
+                    valor_fmt = formateador(valor)
+                    evaluables += 1
+                    cumplidos += int(ok)
+                except Exception:
+                    ok = None
+                    valor_fmt = "N/D"
+            criterios_fila.append({
+                "nombre": nombre_col, "umbral": umbral_txt, "valor": valor_fmt, "ok": ok,
+            })
+        filas.append({
+            "activo": t,
+            "nombre": d.get("nombre", t),
+            "peso_pct": pesos_pct.get(t, 0),
+            "cumplidos": cumplidos,
+            "evaluables": evaluables,
+            "criterios": criterios_fila,
+        })
+
+    filas.sort(key=lambda f: (f["cumplidos"]/f["evaluables"] if f["evaluables"] else 0), reverse=True)
+
+    cumple_mayoria = [f for f in filas if f["evaluables"] and f["cumplidos"] >= f["evaluables"] * 0.66]
+    peso_cumple = sum(f["peso_pct"] for f in cumple_mayoria)
+    promedio_cumplidos = sum(f["cumplidos"] for f in filas) / len(filas) if filas else 0
+
+    return {
+        "estrategia": estrategia,
+        "filas": filas,
+        "resumen": {
+            "n_cumple_mayoria": len(cumple_mayoria),
+            "n_total": len(filas),
+            "peso_cumple_pct": peso_cumple,
+            "promedio_cumplidos": promedio_cumplidos,
+            "total_criterios": len(criterios),
+        },
+    }
