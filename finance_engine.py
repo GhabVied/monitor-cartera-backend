@@ -8,6 +8,8 @@
 # ============================================================
 
 import datetime as dt
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -596,33 +598,65 @@ _CACHE_FUNDAMENTALES: dict[tuple, tuple] = {}
 _CACHE_TTL_SEGUNDOS = 60 * 60 * 24
 
 
-def _fundamentales_de_un_ticker(t: str) -> dict:
-    try:
-        info = yf.Ticker(t).info
-        de = info.get("debtToEquity")
-        de = de / 100 if de is not None else None
-        eps_yoy = info.get("earningsGrowth")
-        if eps_yoy is None:
-            eps_yoy = info.get("earningsQuarterlyGrowth")
-        peg = info.get("pegRatio") or info.get("trailingPegRatio")
-        return {
-            "pe": info.get("trailingPE"),
-            "fwd_pe": info.get("forwardPE"),
-            "de": de,
-            "eps_yoy": eps_yoy,
-            "peg": peg,
-            "market_cap": info.get("marketCap"),
-            "roe": info.get("returnOnEquity"),
-            "gross_margin": info.get("grossMargins"),
-            "profit_margin": info.get("profitMargins"),
-            "nombre": info.get("shortName") or t,
-        }
-    except Exception:
-        return {
-            "pe": None, "fwd_pe": None, "de": None, "eps_yoy": None, "peg": None,
-            "market_cap": None, "roe": None, "gross_margin": None, "profit_margin": None,
-            "nombre": t,
-        }
+# Caché simple en memoria (24hs), igual que el st.cache_data del original.
+# Como Render free es un solo proceso, un dict alcanza; se pierde al reiniciar.
+_CACHE_FUNDAMENTALES: dict[tuple, tuple] = {}
+_CACHE_TTL_SEGUNDOS = 60 * 60 * 24
+_CRUMB_LOCK = threading.Lock()
+_CRUMB_LISTO = False
+
+
+def _asegurar_sesion_yahoo():
+    """Pide la credencial de sesión ("crumb") de Yahoo Finance una sola vez,
+    de forma secuencial. Si varios tickers la piden al mismo tiempo (en
+    paralelo) se pisan entre sí y casi todas las consultas fallan con
+    'Invalid Crumb' — por eso esto se hace ANTES de lanzar los hilos."""
+    global _CRUMB_LISTO
+    if _CRUMB_LISTO:
+        return
+    with _CRUMB_LOCK:
+        if _CRUMB_LISTO:
+            return
+        try:
+            yf.Ticker("AAPL").info  # dispara el handshake cookie+crumb una vez
+        except Exception:
+            pass
+        _CRUMB_LISTO = True
+
+
+def _fundamentales_de_un_ticker(t: str, intentos: int = 2) -> dict:
+    ultimo_error = None
+    for intento in range(intentos):
+        try:
+            info = yf.Ticker(t).info
+            if not info or len(info) < 3:
+                raise ValueError("Respuesta vacía de Yahoo Finance")
+            de = info.get("debtToEquity")
+            de = de / 100 if de is not None else None
+            eps_yoy = info.get("earningsGrowth")
+            if eps_yoy is None:
+                eps_yoy = info.get("earningsQuarterlyGrowth")
+            peg = info.get("pegRatio") or info.get("trailingPegRatio")
+            return {
+                "pe": info.get("trailingPE"),
+                "fwd_pe": info.get("forwardPE"),
+                "de": de,
+                "eps_yoy": eps_yoy,
+                "peg": peg,
+                "market_cap": info.get("marketCap"),
+                "roe": info.get("returnOnEquity"),
+                "gross_margin": info.get("grossMargins"),
+                "profit_margin": info.get("profitMargins"),
+                "nombre": info.get("shortName") or t,
+            }
+        except Exception as e:
+            ultimo_error = e
+            time.sleep(0.8 * (intento + 1))
+    return {
+        "pe": None, "fwd_pe": None, "de": None, "eps_yoy": None, "peg": None,
+        "market_cap": None, "roe": None, "gross_margin": None, "profit_margin": None,
+        "nombre": t, "_error": str(ultimo_error) if ultimo_error else None,
+    }
 
 
 def obtener_fundamentales_screener(tickers: list[str]) -> dict:
@@ -636,8 +670,10 @@ def obtener_fundamentales_screener(tickers: list[str]) -> dict:
         if ahora - guardado_en < _CACHE_TTL_SEGUNDOS:
             return datos_cacheados
 
+    _asegurar_sesion_yahoo()
+
     datos = {}
-    with ThreadPoolExecutor(max_workers=min(8, len(tickers) or 1)) as ex:
+    with ThreadPoolExecutor(max_workers=min(4, len(tickers) or 1)) as ex:
         futuros = {ex.submit(_fundamentales_de_un_ticker, t): t for t in tickers}
         for fut in as_completed(futuros):
             t = futuros[fut]
