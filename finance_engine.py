@@ -287,6 +287,7 @@ def optimizar_cartera(
     retorno_objetivo: float | None = None,
     permitir_corto: bool = False,
     pesos_minimos: np.ndarray | None = None,
+    pesos_maximos: np.ndarray | None = None,
 ) -> np.ndarray | None:
     """objetivo: 'min_vol' | 'max_sharpe' | 'retorno_objetivo'."""
     import scipy.optimize as sco
@@ -295,14 +296,20 @@ def optimizar_cartera(
     piso_default = -1.0 if permitir_corto else 0.0
     if pesos_minimos is None:
         pesos_minimos = np.zeros(n)
+    if pesos_maximos is None:
+        pesos_maximos = np.ones(n)
 
     pisos = np.maximum(piso_default, pesos_minimos)
-    if pisos.sum() > 1.0 + 1e-9:
+    techos = np.minimum(1.0, pesos_maximos)
+    techos = np.maximum(techos, pisos)  # nunca un techo menor que su propio piso
+
+    if pisos.sum() > 1.0 + 1e-9 or techos.sum() < 1.0 - 1e-9:
         return None
 
-    bounds = tuple((float(pisos[i]), 1.0) for i in range(n))
+    bounds = tuple((float(pisos[i]), float(techos[i])) for i in range(n))
     remanente = max(0.0, 1.0 - pisos.sum())
     w0 = pisos + remanente / n
+    w0 = np.minimum(w0, techos)
 
     restricciones = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
 
@@ -326,6 +333,7 @@ def optimizar_cartera(
 def calcular_frontera_eficiente(
     mu: np.ndarray, cov: np.ndarray, n_puntos: int = 30,
     permitir_corto: bool = False, pesos_minimos: np.ndarray | None = None,
+    pesos_maximos: np.ndarray | None = None,
 ) -> list[dict]:
     ret_min, ret_max = mu.min(), mu.max()
     objetivos = np.linspace(ret_min, ret_max, n_puntos)
@@ -333,7 +341,7 @@ def calcular_frontera_eficiente(
     for r_obj in objetivos:
         w = optimizar_cartera(
             mu, cov, "retorno_objetivo", retorno_objetivo=r_obj,
-            permitir_corto=permitir_corto, pesos_minimos=pesos_minimos,
+            permitir_corto=permitir_corto, pesos_minimos=pesos_minimos, pesos_maximos=pesos_maximos,
         )
         if w is not None:
             puntos.append({"retorno": r_obj, "volatilidad": _volatilidad_cartera_w(w, cov)})
@@ -343,6 +351,7 @@ def calcular_frontera_eficiente(
 def optimizacion_completa(
     retornos: pd.DataFrame, pesos_usuario: pd.Series, rf: float,
     permitir_corto: bool = False, pesos_minimos_dict: dict | None = None,
+    pesos_maximos_dict: dict | None = None,
 ) -> dict | None:
     """Arma toda la sección de optimización: cartera min-vol, max-sharpe, frontera
     y la comparación con la cartera del usuario. None si no se pudo resolver."""
@@ -351,14 +360,20 @@ def optimizacion_completa(
 
     mu, cov, activos_opt = preparar_inputs_optimizacion(retornos)
     pesos_minimos_dict = pesos_minimos_dict or {}
+    pesos_maximos_dict = pesos_maximos_dict or {}
     vector_minimos = np.array([pesos_minimos_dict.get(t, 0.0) / 100 for t in activos_opt])
+    vector_maximos = np.array([pesos_maximos_dict.get(t, 100.0) / 100 for t in activos_opt])
 
     if vector_minimos.sum() > 1.0 + 1e-9:
         return {"error": "La suma de los pesos mínimos supera el 100%."}
+    if vector_maximos.sum() < 1.0 - 1e-9:
+        return {"error": "La suma de los pesos máximos es menor al 100%: no hay forma de completar la cartera."}
+    if np.any(vector_minimos > vector_maximos + 1e-9):
+        return {"error": "Hay al menos un activo cuyo mínimo es mayor que su máximo."}
 
-    w_min_vol = optimizar_cartera(mu, cov, "min_vol", permitir_corto=permitir_corto, pesos_minimos=vector_minimos)
-    w_max_sharpe = optimizar_cartera(mu, cov, "max_sharpe", rf=rf, permitir_corto=permitir_corto, pesos_minimos=vector_minimos)
-    frontera = calcular_frontera_eficiente(mu, cov, permitir_corto=permitir_corto, pesos_minimos=vector_minimos)
+    w_min_vol = optimizar_cartera(mu, cov, "min_vol", permitir_corto=permitir_corto, pesos_minimos=vector_minimos, pesos_maximos=vector_maximos)
+    w_max_sharpe = optimizar_cartera(mu, cov, "max_sharpe", rf=rf, permitir_corto=permitir_corto, pesos_minimos=vector_minimos, pesos_maximos=vector_maximos)
+    frontera = calcular_frontera_eficiente(mu, cov, permitir_corto=permitir_corto, pesos_minimos=vector_minimos, pesos_maximos=vector_maximos)
 
     if w_min_vol is None or w_max_sharpe is None:
         return {"error": "No se pudo resolver la optimización con los datos y restricciones actuales."}
@@ -405,6 +420,9 @@ def analizar_cartera(
     fecha_fin: str,
     benchmark_ticker: str,
     rf_pct: float,
+    pesos_minimos: dict[str, float] | None = None,
+    pesos_maximos: dict[str, float] | None = None,
+    permitir_corto: bool = False,
 ) -> dict:
     """Punto de entrada único para el endpoint /api/dashboard.
 
@@ -412,6 +430,9 @@ def analizar_cartera(
     pesos_raw: {ticker: peso en %}, no hace falta que sumen 100 (se normalizan).
     fecha_inicio / fecha_fin: 'YYYY-MM-DD'.
     rf_pct: tasa libre de riesgo anual en % (ej. 4.2, no 0.042).
+    pesos_minimos / pesos_maximos: {ticker: % en 0-100}, usados solo para la
+    optimización de cartera (no afectan tu cartera actual, que usa pesos_raw).
+    permitir_corto: si True, la optimización puede asignar pesos negativos.
 
     Devuelve un dict listo para serializar a JSON con las métricas,
     la curva de equity (cartera vs benchmark, base 100) y el detalle
@@ -492,7 +513,9 @@ def analizar_cartera(
     # Optimización de cartera (frontera eficiente, min-vol, max-sharpe)
     optimizacion = optimizacion_completa(
         retornos, pesos_validos, rf,
-        permitir_corto=False, pesos_minimos_dict=None,
+        permitir_corto=permitir_corto,
+        pesos_minimos_dict=pesos_minimos,
+        pesos_maximos_dict=pesos_maximos,
     )
 
     return {

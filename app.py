@@ -61,6 +61,9 @@ def dashboard():
             fecha_fin=data["fecha_fin"],
             benchmark_ticker=data.get("benchmark", "SPY"),
             rf_pct=float(data.get("rf", 0)),
+            pesos_minimos=data.get("pesos_minimos"),
+            pesos_maximos=data.get("pesos_maximos"),
+            permitir_corto=bool(data.get("permitir_corto", False)),
         )
         return jsonify(_limpiar_nan(resultado))
     except KeyError as e:
