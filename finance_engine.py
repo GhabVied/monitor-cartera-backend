@@ -8,12 +8,14 @@
 # ============================================================
 
 import datetime as dt
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 # En servidores como Render, la carpeta donde yfinance guarda su caché
@@ -602,75 +604,72 @@ _CACHE_TTL_SEGUNDOS = 60 * 60 * 24
 # Como Render free es un solo proceso, un dict alcanza; se pierde al reiniciar.
 _CACHE_FUNDAMENTALES: dict[tuple, tuple] = {}
 _CACHE_TTL_SEGUNDOS = 60 * 60 * 24
-_CRUMB_LOCK = threading.Lock()
-_CRUMB_LISTO = False
+
+# Yahoo Finance bloquea las consultas de datos fundamentales (P/E, ROE, etc.)
+# desde IPs de servidores como Render — no es algo que se pueda arreglar con
+# reintentos, es un bloqueo del lado de Yahoo. Por eso esta parte usa
+# Financial Modeling Prep (financialmodelingprep.com), que tiene un plan
+# gratuito pensado justamente para consultas programáticas como esta.
+# La clave se configura como variable de entorno FMP_API_KEY en Render.
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
+FMP_BASE = "https://financialmodelingprep.com/stable"
 
 
-def _asegurar_sesion_yahoo():
-    """Pide la credencial de sesión ("crumb") de Yahoo Finance una sola vez,
-    de forma secuencial. Si varios tickers la piden al mismo tiempo (en
-    paralelo) se pisan entre sí y casi todas las consultas fallan con
-    'Invalid Crumb' — por eso esto se hace ANTES de lanzar los hilos."""
-    global _CRUMB_LISTO
-    if _CRUMB_LISTO:
-        return
-    with _CRUMB_LOCK:
-        if _CRUMB_LISTO:
-            return
-        try:
-            yf.Ticker("AAPL").info  # dispara el handshake cookie+crumb una vez
-        except Exception:
-            pass
-        _CRUMB_LISTO = True
+def _fmp_get(endpoint: str, symbol: str) -> dict:
+    resp = requests.get(
+        f"{FMP_BASE}/{endpoint}",
+        params={"symbol": symbol, "apikey": FMP_API_KEY},
+        timeout=15,
+    )
+    data = resp.json()
+    if isinstance(data, list):
+        return data[0] if data else {}
+    if isinstance(data, dict) and ("Error Message" in data or "error" in data):
+        raise ValueError(data.get("Error Message") or data.get("error"))
+    return data if isinstance(data, dict) else {}
 
 
-def _fundamentales_de_un_ticker(t: str, intentos: int = 2) -> dict:
-    ultimo_error = None
-    for intento in range(intentos):
-        try:
-            info = yf.Ticker(t).info
-            if not info or len(info) < 3:
-                raise ValueError("Respuesta vacía de Yahoo Finance")
-            de = info.get("debtToEquity")
-            de = de / 100 if de is not None else None
-            eps_yoy = info.get("earningsGrowth")
-            if eps_yoy is None:
-                eps_yoy = info.get("earningsQuarterlyGrowth")
-            peg = info.get("pegRatio") or info.get("trailingPegRatio")
-            return {
-                "pe": info.get("trailingPE"),
-                "fwd_pe": info.get("forwardPE"),
-                "de": de,
-                "eps_yoy": eps_yoy,
-                "peg": peg,
-                "market_cap": info.get("marketCap"),
-                "roe": info.get("returnOnEquity"),
-                "gross_margin": info.get("grossMargins"),
-                "profit_margin": info.get("profitMargins"),
-                "nombre": info.get("shortName") or t,
-            }
-        except Exception as e:
-            ultimo_error = e
-            time.sleep(0.8 * (intento + 1))
-    return {
+def _fundamentales_de_un_ticker(t: str) -> dict:
+    vacio = {
         "pe": None, "fwd_pe": None, "de": None, "eps_yoy": None, "peg": None,
         "market_cap": None, "roe": None, "gross_margin": None, "profit_margin": None,
-        "nombre": t, "_error": str(ultimo_error) if ultimo_error else None,
+        "nombre": t,
     }
+    if not FMP_API_KEY:
+        return {**vacio, "_error": "Falta configurar FMP_API_KEY en el servidor."}
+    try:
+        quote = _fmp_get("quote", t)
+        ratios = _fmp_get("ratios-ttm", t)
+        try:
+            crecimiento = _fmp_get("income-statement-growth", t)
+        except Exception:
+            crecimiento = {}
 
+        return {
+            "pe": quote.get("pe") or ratios.get("priceToEarningsRatioTTM"),
+            "fwd_pe": None,  # No disponible en el plan gratuito de FMP.
+            "de": ratios.get("debtToEquityRatioTTM"),
+            "eps_yoy": crecimiento.get("growthEPS"),
+            "peg": ratios.get("priceToEarningsGrowthRatioTTM"),
+            "market_cap": quote.get("marketCap"),
+            "roe": ratios.get("returnOnEquityTTM"),
+            "gross_margin": ratios.get("grossProfitMarginTTM"),
+            "profit_margin": ratios.get("netProfitMarginTTM"),
+            "nombre": quote.get("name") or t,
+        }
+    except Exception as e:
+        return {**vacio, "_error": str(e)}
 
 def obtener_fundamentales_screener(tickers: list[str]) -> dict:
-    """Trae de Yahoo Finance los datos fundamentales usados por cualquiera de
-    las estrategias de screening. Consulta cada ticker en paralelo (son
-    llamadas independientes) y cachea el resultado combinado 24hs."""
+    """Trae de Financial Modeling Prep los datos fundamentales usados por
+    cualquiera de las estrategias de screening. Consulta cada ticker en
+    paralelo (son llamadas independientes) y cachea el resultado 24hs."""
     clave_cache = tuple(sorted(tickers))
     ahora = dt.datetime.utcnow().timestamp()
     if clave_cache in _CACHE_FUNDAMENTALES:
         guardado_en, datos_cacheados = _CACHE_FUNDAMENTALES[clave_cache]
         if ahora - guardado_en < _CACHE_TTL_SEGUNDOS:
             return datos_cacheados
-
-    _asegurar_sesion_yahoo()
 
     datos = {}
     with ThreadPoolExecutor(max_workers=min(4, len(tickers) or 1)) as ex:
