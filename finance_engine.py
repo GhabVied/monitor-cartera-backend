@@ -599,20 +599,16 @@ ESTRATEGIAS_SCREENER = {"lynch": CRITERIOS_LYNCH, "buffett": CRITERIOS_BUFFETT}
 _CACHE_FUNDAMENTALES: dict[tuple, tuple] = {}
 _CACHE_TTL_SEGUNDOS = 60 * 60 * 24
 
-
-# Caché simple en memoria (24hs), igual que el st.cache_data del original.
-# Como Render free es un solo proceso, un dict alcanza; se pierde al reiniciar.
-_CACHE_FUNDAMENTALES: dict[tuple, tuple] = {}
-_CACHE_TTL_SEGUNDOS = 60 * 60 * 24
-
-# Yahoo Finance bloquea las consultas de datos fundamentales (P/E, ROE, etc.)
-# desde IPs de servidores como Render — no es algo que se pueda arreglar con
-# reintentos, es un bloqueo del lado de Yahoo. Por eso esta parte usa
-# Financial Modeling Prep (financialmodelingprep.com), que tiene un plan
-# gratuito pensado justamente para consultas programáticas como esta.
-# La clave se configura como variable de entorno FMP_API_KEY en Render.
+# Fuente principal: Financial Modeling Prep. Su plan gratuito no cubre datos
+# completos de TODAS las empresas (solo las más grandes/conocidas) — para el
+# resto, devuelve una respuesta vacía en vez de un error. Por eso, cuando a
+# un ticker le faltan datos, se completa con Alpha Vantage como respaldo
+# (su plan gratuito es muy limitado en cantidad —25/día—, así que se usa
+# solo para lo que FMP no trajo, nunca como fuente principal).
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 FMP_BASE = "https://financialmodelingprep.com/stable"
+ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
 
 
 def _fmp_get(endpoint: str, symbol: str) -> dict:
@@ -629,6 +625,50 @@ def _fmp_get(endpoint: str, symbol: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _alpha_vantage_overview(t: str) -> dict:
+    """Respaldo para cuando FMP no trae datos de un ticker. Alpha Vantage no
+    tiene un campo directo de Deuda/Patrimonio (D/E), así que ese campo queda
+    sin completar incluso con este respaldo."""
+    if not ALPHA_VANTAGE_API_KEY:
+        return {}
+    try:
+        resp = requests.get(
+            ALPHA_VANTAGE_URL,
+            params={"function": "OVERVIEW", "symbol": t, "apikey": ALPHA_VANTAGE_API_KEY},
+            timeout=15,
+        )
+        data = resp.json()
+        if not data or "Symbol" not in data:
+            return {}
+
+        def _num(clave):
+            v = data.get(clave)
+            if v in (None, "None", "-", ""):
+                return None
+            try:
+                return float(v)
+            except ValueError:
+                return None
+
+        gross_profit = _num("GrossProfitTTM")
+        revenue = _num("RevenueTTM")
+        gross_margin = (gross_profit / revenue) if (gross_profit and revenue) else None
+
+        return {
+            "pe": _num("PERatio"),
+            "fwd_pe": _num("ForwardPE"),
+            "eps_yoy": _num("QuarterlyEarningsGrowthYOY"),
+            "peg": _num("PEGRatio"),
+            "market_cap": _num("MarketCapitalization"),
+            "roe": _num("ReturnOnEquityTTM"),
+            "gross_margin": gross_margin,
+            "profit_margin": _num("ProfitMargin"),
+            "nombre": data.get("Name"),
+        }
+    except Exception:
+        return {}
+
+
 def _fundamentales_de_un_ticker(t: str) -> dict:
     vacio = {
         "pe": None, "fwd_pe": None, "de": None, "eps_yoy": None, "peg": None,
@@ -637,6 +677,8 @@ def _fundamentales_de_un_ticker(t: str) -> dict:
     }
     if not FMP_API_KEY:
         return {**vacio, "_error": "Falta configurar FMP_API_KEY en el servidor."}
+
+    resultado = dict(vacio)
     try:
         quote = _fmp_get("quote", t)
         ratios = _fmp_get("ratios-ttm", t)
@@ -645,9 +687,8 @@ def _fundamentales_de_un_ticker(t: str) -> dict:
         except Exception:
             crecimiento = {}
 
-        return {
+        resultado.update({
             "pe": quote.get("pe") or ratios.get("priceToEarningsRatioTTM"),
-            "fwd_pe": None,  # No disponible en el plan gratuito de FMP.
             "de": ratios.get("debtToEquityRatioTTM"),
             "eps_yoy": crecimiento.get("growthEPS"),
             "peg": ratios.get("priceToEarningsGrowthRatioTTM"),
@@ -656,14 +697,27 @@ def _fundamentales_de_un_ticker(t: str) -> dict:
             "gross_margin": ratios.get("grossProfitMarginTTM"),
             "profit_margin": ratios.get("netProfitMarginTTM"),
             "nombre": quote.get("name") or t,
-        }
+        })
     except Exception as e:
-        return {**vacio, "_error": str(e)}
+        resultado["_error_fmp"] = str(e)
+
+    # Si a FMP le faltan la mayoría de los campos clave, completamos con
+    # Alpha Vantage (respaldo, no reemplaza a FMP donde este sí respondió).
+    campos_clave = ["pe", "roe", "gross_margin", "profit_margin", "market_cap"]
+    faltantes = sum(1 for c in campos_clave if resultado.get(c) is None)
+    if faltantes >= 3:
+        respaldo = _alpha_vantage_overview(t)
+        for k, v in respaldo.items():
+            if v is not None and resultado.get(k) is None:
+                resultado[k] = v
+
+    return resultado
+
 
 def obtener_fundamentales_screener(tickers: list[str]) -> dict:
-    """Trae de Financial Modeling Prep los datos fundamentales usados por
-    cualquiera de las estrategias de screening. Consulta cada ticker en
-    paralelo (son llamadas independientes) y cachea el resultado 24hs."""
+    """Trae los datos fundamentales usados por cualquiera de las estrategias
+    de screening (FMP como fuente principal, Alpha Vantage como respaldo).
+    Consulta cada ticker en paralelo y cachea el resultado combinado 24hs."""
     clave_cache = tuple(sorted(tickers))
     ahora = dt.datetime.utcnow().timestamp()
     if clave_cache in _CACHE_FUNDAMENTALES:
