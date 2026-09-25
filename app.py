@@ -9,10 +9,11 @@
 
 import math
 
+import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from finance_engine import analizar_cartera, evaluar_screener, test_estres
+from finance_engine import analizar_cartera, analizar_sec, evaluar_screener, test_estres
 
 app = Flask(__name__)
 
@@ -125,6 +126,34 @@ def screener():
         return jsonify({"error": f"Falta el campo {e}"}), 400
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"Error interno: {e}"}), 500
+
+
+@app.post("/api/sec")
+def sec_edgar():
+    """
+    Body JSON esperado:
+    {
+      "ticker": "GOOGL",
+      "user_agent": "Tu Nombre email@ejemplo.com",   // la SEC lo exige
+      "sector_etf": "XLK"   // opcional, si no se manda se autodetecta
+    }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        resultado = analizar_sec(
+            ticker=data.get("ticker", ""),
+            user_agent=data.get("user_agent", ""),
+            sector_etf_override=data.get("sector_etf"),
+        )
+        return jsonify(_limpiar_nan(resultado))
+    except KeyError as e:
+        return jsonify({"error": f"Falta el campo {e}"}), 400
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except requests.exceptions.HTTPError as e:
+        return jsonify({"error": f"La SEC rechazó la consulta: {e}"}), 400
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": f"Error interno: {e}"}), 500
 

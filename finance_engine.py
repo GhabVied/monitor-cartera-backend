@@ -800,3 +800,190 @@ def evaluar_screener(tickers: list[str], pesos_raw: dict[str, float], estrategia
             "total_criterios": len(criterios),
         },
     }
+
+
+# ============================================================
+# SEC EDGAR + COMPARACIÓN SECTORIAL (Pestaña 4 de la app original)
+# ============================================================
+
+MAPEO_SECTOR_ETF = {
+    "Technology": "XLK",
+    "Communication Services": "XLC",
+    "Financial Services": "XLF",
+    "Financial": "XLF",
+    "Healthcare": "XLV",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Energy": "XLE",
+    "Industrials": "XLI",
+    "Basic Materials": "XLB",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE",
+}
+
+CONCEPTOS_SEC = {
+    "Revenues": ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax"],
+    "NetIncomeLoss": ["NetIncomeLoss", "ProfitLoss"],
+    "OperatingIncomeLoss": ["OperatingIncomeLoss"],
+    "Assets": ["Assets"],
+    "Liabilities": ["Liabilities"],
+    "StockholdersEquity": ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+    "EPSDiluted": ["EarningsPerShareDiluted"],
+}
+
+
+def _detectar_sector(ticker: str) -> str | None:
+    """El sector se pide a FMP (el .info de yfinance está bloqueado desde
+    Render, igual que con el screener)."""
+    if not FMP_API_KEY:
+        return None
+    try:
+        perfil = _fmp_get("profile", ticker)
+        return perfil.get("sector") or None
+    except Exception:
+        return None
+
+
+def _obtener_cik(ticker: str, user_agent: str) -> tuple[str, dict]:
+    headers = {"User-Agent": user_agent}
+    r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=30)
+    r.raise_for_status()
+    for item in r.json().values():
+        if item.get("ticker", "").upper() == ticker.upper():
+            cik = str(item["cik_str"]).zfill(10)
+            r_facts = requests.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json", headers=headers, timeout=30)
+            r_facts.raise_for_status()
+            return cik, r_facts.json()
+    raise ValueError(f"Ticker no encontrado en el listado de la SEC: {ticker}")
+
+
+def _extraer_anual(facts: dict, conceptos_candidatos: list[str], nombre_metrica: str, taxonomia: str = "us-gaap"):
+    bloque = facts.get("facts", {}).get(taxonomia, {})
+    series_validas = []
+    for concepto in conceptos_candidatos:
+        if concepto not in bloque:
+            continue
+        unidades = bloque[concepto].get("units", {})
+        if not unidades:
+            continue
+        unidad = "USD" if "USD" in unidades else ("USD/shares" if "USD/shares" in unidades else next(iter(unidades)))
+        registros = unidades[unidad]
+        df = pd.DataFrame(registros)
+        if df.empty or "end" not in df.columns or "val" not in df.columns:
+            continue
+        if "form" in df.columns:
+            df = df[df["form"].astype(str).str.contains("10-K", na=False)]
+        if df.empty:
+            continue
+        if "fp" in df.columns:
+            anual = df[df["fp"] == "FY"]
+            if not anual.empty:
+                df = anual
+        if "filed" in df.columns:
+            df = df.sort_values("filed")
+        df = df.drop_duplicates(subset=["end"], keep="last")
+        df = df[["end", "val"]].rename(columns={"val": concepto})
+        df["end"] = pd.to_datetime(df["end"])
+        df["anio_fiscal"] = df["end"].dt.year
+        df = df.sort_values("end").drop_duplicates(subset=["anio_fiscal"], keep="last")
+        df = df[["anio_fiscal", concepto]].reset_index(drop=True)
+        if len(df) > 0:
+            series_validas.append((concepto, df))
+    if not series_validas:
+        return None
+    series_validas.sort(key=lambda x: len(x[1]), reverse=True)
+    concepto_base, df_final = series_validas[0]
+    df_final = df_final.rename(columns={concepto_base: nombre_metrica})
+    for concepto_alt, df_alt in series_validas[1:]:
+        df_alt = df_alt.rename(columns={concepto_alt: nombre_metrica})
+        anios_faltantes = set(df_alt["anio_fiscal"]) - set(df_final["anio_fiscal"])
+        if anios_faltantes:
+            extra = df_alt[df_alt["anio_fiscal"].isin(anios_faltantes)]
+            df_final = pd.concat([df_final, extra], ignore_index=True)
+    return df_final.sort_values("anio_fiscal").reset_index(drop=True)
+
+
+TEXTO_LECTURA_PERFORMANCE = (
+    "Si la línea de la empresa está por encima del sector y del mercado, la acción viene superando "
+    "tanto a sus pares directos como al mercado en general; si está por debajo de ambos, viene "
+    "rindiendo peor de forma generalizada. Si supera al sector pero no al mercado (o viceversa), hay "
+    "que distinguir si el problema o la fortaleza es específico de la empresa o de todo su sector. "
+    "Una acción que rindió muy por debajo de su sector sin una razón fundamental clara puede estar "
+    "genuinamente subvaluada, pero también puede reflejar un deterioro real del negocio que el "
+    "mercado ya está anticipando. La brecha de performance por sí sola nunca alcanza para decidir: "
+    "hay que cruzarla siempre con la calidad de los fundamentales (márgenes, ROE, deuda)."
+)
+
+TEXTO_LECTURA_FUNDAMENTALES = (
+    "Ingresos y utilidad neta creciendo de forma sostenida, junto con margen neto y ROE estables o en "
+    "alza, son la señal clásica de 'buenos fundamentos'. Si los ingresos crecen pero el margen neto "
+    "cae, la empresa está vendiendo más pero ganando proporcionalmente menos por cada dólar de venta. "
+    "Una empresa con fundamentos deteriorándose que además cotiza 'barata' frente al sector no es "
+    "necesariamente una oportunidad: puede ser una 'trampa de valor', donde el precio bajo simplemente "
+    "refleja, con razón, un negocio que empeora. Una oportunidad real de subvaluación aparece cuando "
+    "los fundamentales se mantienen sólidos o mejoran, pero el precio de mercado todavía no lo refleja "
+    "frente al sector o al mercado en general."
+)
+
+
+def analizar_sec(ticker: str, user_agent: str, sector_etf_override: str | None = None) -> dict:
+    ticker = ticker.strip().upper()
+    if not user_agent or "@" not in user_agent:
+        raise ValueError("Ingresá un User-Agent válido (nombre y email) — la SEC lo exige para acceder a su API pública.")
+
+    sector_empresa = _detectar_sector(ticker) or "Sin clasificar"
+    sector_etf_sugerido = MAPEO_SECTOR_ETF.get(sector_empresa, "SPY")
+    sector_etf = (sector_etf_override or sector_etf_sugerido).strip().upper()
+    benchmark = "SPY"
+
+    cik, facts = _obtener_cik(ticker, user_agent)
+    razon_social = facts.get("entityName", ticker)
+
+    tabla = None
+    for nombre_metrica, candidatos in CONCEPTOS_SEC.items():
+        df = _extraer_anual(facts, candidatos, nombre_metrica)
+        if df is not None:
+            tabla = df if tabla is None else pd.merge(tabla, df, on="anio_fiscal", how="outer")
+
+    tabla_json = []
+    if tabla is not None:
+        tabla = tabla.sort_values("anio_fiscal").reset_index(drop=True)
+        if "Revenues" in tabla.columns and "NetIncomeLoss" in tabla.columns:
+            tabla["margen_neto_pct"] = tabla["NetIncomeLoss"] / tabla["Revenues"] * 100
+        if "NetIncomeLoss" in tabla.columns and "StockholdersEquity" in tabla.columns:
+            tabla["ROE_pct"] = tabla["NetIncomeLoss"] / tabla["StockholdersEquity"] * 100
+        if "NetIncomeLoss" in tabla.columns and "Assets" in tabla.columns:
+            tabla["ROA_pct"] = tabla["NetIncomeLoss"] / tabla["Assets"] * 100
+        if "Liabilities" in tabla.columns and "StockholdersEquity" in tabla.columns:
+            tabla["deuda_patrimonio"] = tabla["Liabilities"] / tabla["StockholdersEquity"]
+        if "OperatingIncomeLoss" in tabla.columns and "Revenues" in tabla.columns:
+            tabla["margen_operativo_pct"] = tabla["OperatingIncomeLoss"] / tabla["Revenues"] * 100
+        tabla_json = tabla.tail(8).replace({np.nan: None}).to_dict(orient="records")
+
+    # Performance de precio: empresa vs benchmark vs ETF del sector.
+    performance = None
+    tickers_precio = list(dict.fromkeys([ticker, benchmark, sector_etf]))
+    precios = descargar_precios(tickers_precio, dt.date(2020, 1, 1), dt.date.today())
+    if not precios.empty and all(t in precios.columns for t in tickers_precio):
+        precios = precios.dropna()
+        indices = precios / precios.iloc[0] * 100
+        performance = {
+            "fechas": [d.strftime("%Y-%m-%d") for d in indices.index],
+            "ticker": indices[ticker].round(3).tolist(),
+            "benchmark": indices[benchmark].round(3).tolist(),
+            "sector_etf": indices[sector_etf].round(3).tolist(),
+        }
+
+    return {
+        "ticker": ticker,
+        "razon_social": razon_social,
+        "cik": cik,
+        "sector": sector_empresa,
+        "sector_etf": sector_etf,
+        "sector_etf_sugerido": sector_etf_sugerido,
+        "benchmark": benchmark,
+        "tabla_fundamentales": tabla_json,
+        "performance": performance,
+        "texto_lectura_performance": TEXTO_LECTURA_PERFORMANCE,
+        "texto_lectura_fundamentales": TEXTO_LECTURA_FUNDAMENTALES,
+    }
